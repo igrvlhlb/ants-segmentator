@@ -2,6 +2,7 @@ from ast import Tuple
 import cv2
 import numpy as np
 from functools import reduce
+from numba import jit, float64, int32
 
 ALPHA = 10
 BETA = 1
@@ -113,11 +114,14 @@ class Segmentator:
                 visibility_matrix[i,j] = self.calc_visibility(i, j, max_val)
         return visibility_matrix
 
+    @staticmethod
+    @jit(float64(int32, int32, int32, int32), nopython=True, fastmath=True, cache=True)
+    def _dist(p0x, p0y, p1x, p1y):
+        return np.sqrt((p0x - p1x)**2 + (p0y - p1y)**2)
+    
     # distance between a point and the closest endpoint
     def dist(self, p0):
-        def _dist(p0, p1):
-            return np.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2)
-        return min([_dist(p0, p1) for p1 in self.endpoints])
+        return min([self._dist(p0[0], p0[1], p1[0], p1[1]) for p1 in self.endpoints])
 
 # can iterate over and add elements
 class LimitedQueue:
