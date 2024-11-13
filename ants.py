@@ -1,40 +1,151 @@
+#!/usr/bin/env python3
+
+import tqdm
+import pathlib
+import argparse
+import sys
 from ast import Tuple
 import cv2
 import numpy as np
 from functools import reduce
+from numba import jit, float64, int64, typed, types
+from numba.types import UniTuple
 
 ALPHA = 10
 BETA = 1
 RHO = 0.05
-Q = 1
+Q = 10
+VERBOSE = False
 
-# baseado em https://stackoverflow.com/a/67145008
-def get_end_pnts(pnts, img):
-    extremes = []
-    for p in pnts:
-        x = p[0]
-        y = p[1]
-        n = 0
-        if (y > 0):
-            n += img[y - 1,x]
-            if (x > 0):
-                n += img[y - 1,x - 1]
-            if (x < img.shape[1] - 1):
-                n += img[y - 1,x + 1]
-        if (x > 0):
-            n += img[y,x - 1]
-            if (y < img.shape[0] - 1):
-                n += img[y + 1,x - 1]
-        if (x < img.shape[1] - 1):
-            n += img[y,x + 1]
-        if (y < img.shape[0] - 1):
-            n += img[y + 1,x]
-            if (x < img.shape[1] - 1):
-                n += img[y + 1,x + 1]
-        n /= 255
-        if n == 1:
-            extremes.append(p)
-    return extremes
+INT_PAIR = UniTuple(int64, 2)
+
+@jit(INT_PAIR(INT_PAIR), nopython=True)
+def swap(tup):
+    return (tup[1], tup[0])
+
+
+class Segmentator:
+    def __init__(self, original_img, sobel_img, memsize=10):
+        self.original_img = original_img
+        self.sobel_img = sobel_img
+        self.visibility_matrix = self.calc_visibility_matrix()
+        self.pheromone_matrix = np.array(self.visibility_matrix, dtype='double')
+        self.endpoints = self.detect_endpoints()
+        self.ants = self.endpoints.copy()
+        self.initial_endpoints = self.ants.copy()
+        self.tabu_lists = [LimitedQueue([point], memsize) for point in self.ants]
+        self.visited_matrix = np.zeros(original_img.shape, dtype='bool')
+
+
+    def detect_endpoints(self):
+        img = 255 - self.sobel_img
+
+        k1 = np.array(([0, 0, 0], [-1, 1, -1], [-1, -1, -1]), dtype="int")
+        k2 = np.array(([0, -1, -1], [0, 1, -1], [0, -1, -1]), dtype="int")
+        k3 = np.array(([-1, -1, 0],  [-1, 1, 0], [-1, -1, 0]), dtype="int")
+        k4 = np.array(([-1, -1, -1], [-1, 1, -1], [0, 0, 0]), dtype="int")
+
+        convolutions = [k1, k2, k3, k4]
+
+        # perform hit-miss transform for every kernel
+        out = reduce(lambda x, y: x + y,
+            [cv2.morphologyEx(img, cv2.MORPH_HITMISS, k) for k in convolutions[1:]],
+            cv2.morphologyEx(img, cv2.MORPH_HITMISS, convolutions[0]))
+
+        # find points in white (255) and draw them on original image
+        pts = np.argwhere(out == 255)
+
+        return [(x,y) for (y,x) in pts if img[y,x] == 255]
+
+    def ant_colony_optimization(self, alpha=ALPHA, beta=BETA, rho=RHO, q=Q, limit=10):
+        n_initial = len(self.ants)
+        stopped_ants = []
+        pbar = tqdm.tqdm(total=limit)
+        for iteration in range(limit):
+            pbar.desc = f'({len(self.ants)}/{n_initial} ants)'
+            #if VERBOSE:
+                #print(f'iteration: {iteration} ({len(self.ants)}/{n_initial} ants)')
+            if (stopped_ants):
+                ants_to_remove = sorted(stopped_ants, reverse=True)
+                for idx in ants_to_remove:
+                    self.ants.pop(idx)
+                    self.tabu_lists.pop(idx)
+                    self.initial_endpoints.pop(idx)
+                stopped_ants = []
+            if len(self.ants) == 0:
+                break
+            for k in range(len(self.ants)):
+                ant = self.ants[k]
+                tabu_list = self.tabu_lists[k]
+                new_point = self.calc_transition_for_ant(k, alpha, beta)
+                if (new_point == None):
+                    stopped_ants.append(k)
+                    break
+                self.ants[k] = new_point
+                tabu_list.add(new_point)
+                self.visited_matrix[swap(new_point)] = True
+                if new_point in self.endpoints:
+                    stopped_ants.append(k)
+                    print(f"Endpoint found by ant {k}")
+            self.pheromone_update(rho, q)
+            pbar.update(1)
+        pbar.close()
+        return self.pheromone_matrix
+
+    def calc_transition_for_ant(self, k, alpha, beta):
+        r, s = self.ants[k]
+        initial_endpoint = self.initial_endpoints[k]
+        range_x = range(max(0, r-1), min(self.original_img.shape[0], r+2))
+        range_y = range(max(0, s-1), min(self.original_img.shape[1], s+2))
+        points = [(u,v) for u in range_x for v in range_y if (u,v) not in self.tabu_lists[k]]
+        denom = sum([self.pheromone_matrix[v,u]**alpha * self.dist((u,v), initial_endpoint)**beta for (u,v) in points])
+        if denom == 0 or np.isnan(denom):
+            return None
+        probabilities = [(self.pheromone_matrix[j,i]**alpha * self.dist((i,j), initial_endpoint)**beta) / denom for (i,j) in points]
+        chosen_idx = np.random.choice(len(points), p=probabilities)
+        return points[chosen_idx]
+
+    def pheromone_update(self, rho, q):
+        self.pheromone_matrix *= (1 - rho)
+        for k in range(len(self.ants)):
+            i, j = self.ants[k]
+            self.pheromone_matrix[j,i] += self.fitness(k)/q
+
+    def fitness(self, k):
+        j, i = self.ants[k]
+        trail = self.tabu_lists[k]
+        mean = np.mean([self.visibility_matrix[p] for p in trail])
+        dev = np.std([self.visibility_matrix[p] for p in trail]) or 1
+        return mean / (dev * len(trail))
+
+    def calc_visibility(self, i, j, max_val):
+        img = self.original_img
+        h, w = img.shape
+        img2 = np.array(img, dtype='int16')
+        vals = (np.abs(img2[i-1, j-1] - img2[i+1, j-1]) if (0 < i < w-1 and j > 0) else 0,
+                np.abs(img2[i-1, j+1] - img2[i+1, j+1]) if (0 < i < w-1 and j < w-1) else 0,
+                np.abs(img2[i, j-1] - img2[i, j+1]) if (0 < j < w-1) else 0,
+                np.abs(img2[i-1, j] - img2[i+1, j]) if (0 < i < h-1) else 0)
+        return max(vals) / max_val
+
+    def calc_visibility_matrix(self):
+        img = self.original_img
+        max_val = img.max()
+        visibility_matrix = np.zeros(img.shape, dtype='double')
+        h, w = img.shape
+        for i in range(h):
+            for j in range(w):
+                visibility_matrix[i,j] = self.calc_visibility(i, j, max_val)
+        return visibility_matrix
+
+    @staticmethod
+    @jit(float64(INT_PAIR, INT_PAIR), nopython=True, fastmath=True, cache=True)
+    def _dist(p0, p1):
+        return np.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2)
+    
+    # distance between a point and the closest endpoint
+    def dist(self, p0, initial_endpoint):
+        return min([self._dist(p0, p1) for p1 in self.endpoints if p1 != initial_endpoint])
 
 # can iterate over and add elements
 class LimitedQueue:
@@ -62,173 +173,94 @@ class LimitedQueue:
     def __repr__(self):
         return repr(self.queue)
 
-def detect_endpoints2(img):
-    nz = cv2.findNonZero(255 - img)
-    pts = np.squeeze(nz)
-    ext = get_end_pnts(pts, img)
-    return ext
-
-def detect_endpoints3(img):
-    # Set the end-points kernel:
-    h = np.array([[1, 1, 1],
-                  [1, 10, 1],
-                  [1, 1, 1]])
-
-    # Convolve the image with the kernel:
-    imgFiltered = cv2.filter2D(img, -1, h)
-
-    # Extract only the end-points pixels, those with
-    # an intensity value of 110:
-    endPointsMask = np.where(imgFiltered == 110, 255, 0)
-    # The above operation converted the image to 32-bit float,
-    # convert back to 8-bit uint
-    endPointsMask = endPointsMask.astype(np.uint8)
-
-    return [(x,y) for (x,y) in np.argwhere(imgFiltered == 110)]
-
-
-
-# baseado em https://stackoverflow.com/a/72353635
-def detect_endpoints(img):
-    img2 = 255 - img
-
-    # kernels to find endpoints in all 4 directions
-    k1 = np.array(([0, 0, 0], [-1, 1, -1], [-1, -1, -1]), dtype="int")
-    k2 = np.array(([0, -1, -1], [0, 1, -1], [0, -1, -1]), dtype="int")
-    k3 = np.array(([-1, -1, 0],  [-1, 1, 0], [-1, -1, 0]), dtype="int")
-    k4 = np.array(([-1, -1, -1], [-1, 1, -1], [0, 0, 0]), dtype="int")
-
-#    k5 = np.array(([0, 0, 0], [0, 1, -1], [0, -1, -1]), dtype="int")
-#    k6 = np.array(([0, -1, -1], [0, 1, -1], [0, 0, 0]), dtype="int")
-#    k7 = np.array(([-1, -1, 0], [-1, 1, 0], [0, 0, 0]), dtype="int")
-#    k8 = np.array(([0, 0, 0], [-1, 1, 0], [-1, -1, 0]), dtype="int")
-#
-#    k9 = np.array(([-1, -1, -1], [0, 1, -1], [-1, -1, -1]), dtype="int")
-#    k10 = np.array(([-1, -1, -1], [-1, 1, -1], [-1, 0, -1]), dtype="int")
-#    k11 = np.array(([0, -1, -1], [-1, 1, -1], [-1, -1, -1]), dtype="int")
-#    k12 = np.array(([-1, -1, -1], [-1, 1, -1], [-1, -1, 0]), dtype="int")
-#    k13 = np.array(([-1, 0, -1], [-1, 1, -1], [-1, -1, -1]), dtype="int")
-#    k14 = np.array(([-1, -1, -1], [-1, 1, -1], [-1, 0, -1]), dtype="int")
-
-    convolutions = [k1, k2, k3, k4] # k5, k6, k7, k8, k9, k10, k11, k12, k13, k14]
-
-    # perform hit-miss transform for every kernel
-    out = reduce(lambda x, y: x + y,
-        [cv2.morphologyEx(img, cv2.MORPH_HITMISS, k) for k in convolutions[1:]],
-        cv2.morphologyEx(img, cv2.MORPH_HITMISS, convolutions[0]))
-
-    # find points in white (255) and draw them on original image
-    pts = np.argwhere(out == 255)
-
-    return [(x,y) for (y,x) in pts if img[x,y] == 0]
 
 def draw_endpoints(img, pts):
-    img2 = img.copy()
-    img2 = cv2.cvtColor(img2, cv2.COLOR_GRAY2RGB)
+    # verify if image not already rgb
+    if len(img.shape) == 3:
+        img2 = img.copy()
+    else:
+        img2 = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     for pt in pts:
-        img2 = cv2.circle(img2, (pt[0], pt[1]), 2, (0,255,0), -1)
+        #img2 = cv2.circle(img2, (pt[0], pt[1]), 2, (0,255,0), -1)
+        # draw a small square
+        img2 = cv2.rectangle(img2, (pt[0]-1, pt[1]-1), (pt[0]+1, pt[1]+1), (0,255,0), -1)
     return img2
 
-def calc_visibility(img, i, j, max_val):
-    h, w = img.shape
-    img2 = np.array(img, dtype='int16')
-    vals = (np.abs(img2[i-1, j-1] - img2[i+1, j-1]) if (0 < i < w-1 and j > 0) else 0,
-            np.abs(img2[i-1, j+1] - img2[i+1, j+1]) if (0 < i < w-1 and j < w-1) else 0,
-            np.abs(img2[i, j-1] - img2[i, j+1]) if (0 < j < w-1) else 0,
-            np.abs(img2[i-1, j] - img2[i+1, j]) if (0 < i < h-1) else 0)
-    return max(vals) / max_val
+def draw_comparison(sobel, visited):
+    img = cv2.cvtColor(sobel, cv2.COLOR_GRAY2RGB)
+    img[sobel == 0] = [255,0,0]
 
-def calc_visibility_matrix(img):
-    max_val = img.max()
-    visibility_matrix = np.zeros(img.shape, dtype='double')
-    h, w = img.shape
-    for i in range(h):
-        for j in range(w):
-            visibility_matrix[i,j] = calc_visibility(img, i, j, max_val)
-    return visibility_matrix
+    diff_img = np.where((visited == 0) & (sobel == 255), 0, 255)
+    img[diff_img == 0] = [0,0,255]
 
-# distance between a point and the closest endpoint
-def dist(p0, endpoints):
-    def _dist(p0, p1):
-        return np.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2)
-    return min([_dist(p0, p1) for p1 in endpoints])
+    # set background to gray
+    img[(visited == 255) & (sobel == 255)] = [128,128,128]
 
-def calc_transition_for_ant(img, ant, pheromone_matrix, tabu_list, endpoints):
-    r, s = ant
-    range_x = range(max(0, r-1), min(img.shape[0], r+2))
-    range_y = range(max(0, s-1), min(img.shape[1], s+2))
-    points = [(u,v) for u in range_x for v in range_y if (u,v) not in tabu_list]
-    denom = sum([pheromone_matrix[u,v]**ALPHA * dist((u,v), endpoints)**BETA for (u,v) in points])
-    if denom == 0 or np.isnan(denom):
-        return None
-    probabilities = [(pheromone_matrix[i,j]**ALPHA * dist((i,j), endpoints)**BETA) / denom for (i,j) in points]
-    chosen_idx = np.random.choice(len(points), p=probabilities)
-    #print(points[chosen_idx])
-    return points[chosen_idx]
+    return diff_img, img
 
+def main(args):
+    iterations = args.iterations
+    alpha, beta, rho, q = args.alpha, args.beta, args.rho, args.q
 
-def fitness(trail, visibility_matrix):
-    mean = np.mean([visibility_matrix[p] for p in trail])
-    dev = np.std([visibility_matrix[p] for p in trail]) or 1
-    return mean / (dev * len(trail))
+    original_img = cv2.imread(args.grayscale, flags=cv2.IMREAD_GRAYSCALE)
+    sobel_img = cv2.imread(args.sobel, flags=cv2.IMREAD_GRAYSCALE)
 
-def pheromone_update(ants, tabu_lists, pheromone_matrix, visibility_matrix):
-    pheromone_matrix *= (1 - RHO)
-    for (ant, trail) in zip(ants, tabu_lists):
-        i, j = ant
-        pheromone_matrix[i,j] += fitness(trail, visibility_matrix)
+    segmentator = Segmentator(original_img, sobel_img, args.memory)
+    print(f"{len(segmentator.endpoints)} endpoints found")
+    segmentator.ant_colony_optimization(alpha, beta, rho, q, iterations)
 
-def ant_colony_optimization(ants, visibility_matrix, pheromone_matrix, tabu_lists, endpoints, visited_matrix, limit=300):
-    stopped_ants = []
-    for iteration in range(limit):
-        print(iteration)
-        if (stopped_ants):
-            ants_to_remove = sorted(stopped_ants, reverse=True)
-            for idx in ants_to_remove:
-                ants.pop(idx)
-                tabu_lists.pop(idx)
-            stopped_ants = []
-        if len(ants) == 0:
-            break
-        for k in range(len(ants)):
-            ant = ants[k]
-            tabu_list = tabu_lists[k]
-            new_point = calc_transition_for_ant(visibility_matrix, ant, pheromone_matrix, tabu_list, endpoints)
-            if (new_point == None):
-                stopped_ants.append(k)
-                break
-            ants[k] = new_point
-            tabu_list.add(new_point)
-            visited_matrix[new_point] = True
-            if new_point in endpoints:
-                stopped_ants.append(k)
-                print(f"Endpoint found by ant {k}")
-        pheromone_update(ants, tabu_lists, pheromone_matrix, visibility_matrix)
-    return pheromone_matrix
+    write_imgs(segmentator, sobel_img, args.output)
 
-def main():
-    original_img = cv2.imread('peppers.bmp', flags=cv2.IMREAD_GRAYSCALE)
-    sobel_img = cv2.imread('peppers-sobel-thin.bmp', flags=cv2.IMREAD_GRAYSCALE)
-    visibility_matrix = calc_visibility_matrix(original_img)
-    pheromone_matrix = np.array(visibility_matrix, dtype='double')
-    visited_matrix = np.zeros(visibility_matrix.shape, dtype='bool')
-    endpoints = detect_endpoints(255 - sobel_img)
-    for endpoint in endpoints:
-        visited_matrix[endpoint] = True
-    print(f"{len(endpoints)} endpoints found")
-    cv2.imwrite('res/endpoints.bmp', draw_endpoints(sobel_img, endpoints))
-    cv2.imwrite('res/visibility_matrix.bmp', visibility_matrix*255)
-    ants = endpoints.copy()
-    tabu_list = [LimitedQueue([point]) for point in ants]
-    ant_colony_optimization(ants, visibility_matrix, pheromone_matrix, tabu_list, endpoints, visited_matrix, 10)
-    visited_img = np.where(visited_matrix == True, 0, 255)
-    #cv2.imshow('pheromone matri', pheromone_matrix); cv2.waitKey(); cv2.destroyAllWindows()
+def write_imgs(segmentator, sobel_img, output_dir):
+
+    outdir = pathlib.Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    visited_img = np.where(segmentator.visited_matrix == True, 0, 255)
+
+    cv2.imwrite(outdir / 'endpoints.bmp', draw_endpoints(sobel_img, segmentator.endpoints))
+
+    cv2.imwrite(outdir / 'visibility_matrix.bmp', segmentator.visibility_matrix*255)
+
+    cv2.imwrite(outdir / 'visited.bmp', visited_img)
+
+    cv2.imwrite(outdir / 'pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
+
+    diff_img, cmp_img = draw_comparison(sobel_img, visited_img)
+
+    cv2.imwrite(outdir / 'diff.bmp', diff_img)
+    cv2.imwrite(outdir / 'cmp.bmp', cmp_img)
+    cv2.imwrite(outdir / 'cmp-endpoints.bmp', draw_endpoints(cmp_img, segmentator.endpoints))
+    
     result = np.minimum(visited_img, sobel_img)
-    cv2.imwrite('res/visited.bmp', visited_img)
-    cv2.imwrite('res/pheromone_matrix.bmp', (pheromone_matrix / pheromone_matrix.max())*255)
-    cv2.imwrite('res/pheromone_matrix_nonzero.bmp', np.array(np.where(pheromone_matrix > 0, 0, 255), 'uint8'))
-    cv2.imwrite('res/result.bmp', result)
-    return pheromone_matrix
+    cv2.imwrite(outdir / 'result.bmp', result)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Ant Colony Optimization for image segmentation')
+    parser.add_argument('grayscale', type=str, help='Grayscale Image file')
+    parser.add_argument('sobel', type=str, help='Sobel Image file')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Print debug information')
+    parser.add_argument('-i', '--iterations', type=int, default=10, help='Number of iterations')
+    parser.add_argument('-o', '--output', default='outputs', help='Output directory')
+    parser.add_argument('-m', '--memory', type=int, default=10, help='Tabu list max size')
+    parser.add_argument('-a', '--alpha', type=float, default=10, help='Alpha parameter')
+    parser.add_argument('-b', '--beta', type=float, default=1, help='Beta parameter')
+    parser.add_argument('-r', '--rho', type=float, default=0.05, help='Rho parameter')
+    parser.add_argument('-q', '--q', type=float, default=1, help='Q parameter')
+    return parser.parse_args()
+
 
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    VERBOSE = args.verbose
+    print(args)
+    main(args)
+
+# parse command line arguments
+# -v verbose
+# -i iterations
+# -o output directory
+# -h help
+# python ants.py -i 10 -o res
+# use argparse
