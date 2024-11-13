@@ -32,6 +32,7 @@ class Segmentator:
         self.pheromone_matrix = np.array(self.visibility_matrix, dtype='double')
         self.endpoints = self.detect_endpoints()
         self.ants = self.endpoints.copy()
+        self.initial_endpoints = self.ants.copy()
         self.tabu_lists = [LimitedQueue([point], memsize) for point in self.ants]
         self.visited_matrix = np.zeros(original_img.shape, dtype='bool')
 
@@ -69,6 +70,7 @@ class Segmentator:
                 for idx in ants_to_remove:
                     self.ants.pop(idx)
                     self.tabu_lists.pop(idx)
+                    self.initial_endpoints.pop(idx)
                 stopped_ants = []
             if len(self.ants) == 0:
                 break
@@ -92,13 +94,14 @@ class Segmentator:
 
     def calc_transition_for_ant(self, k, alpha, beta):
         r, s = self.ants[k]
+        initial_endpoint = self.initial_endpoints[k]
         range_x = range(max(0, r-1), min(self.original_img.shape[0], r+2))
         range_y = range(max(0, s-1), min(self.original_img.shape[1], s+2))
         points = [(u,v) for u in range_x for v in range_y if (u,v) not in self.tabu_lists[k]]
-        denom = sum([self.pheromone_matrix[v,u]**alpha * self.dist((u,v))**beta for (u,v) in points])
+        denom = sum([self.pheromone_matrix[v,u]**alpha * self.dist((u,v), initial_endpoint)**beta for (u,v) in points])
         if denom == 0 or np.isnan(denom):
             return None
-        probabilities = [(self.pheromone_matrix[j,i]**alpha * self.dist((i,j))**beta) / denom for (i,j) in points]
+        probabilities = [(self.pheromone_matrix[j,i]**alpha * self.dist((i,j), initial_endpoint)**beta) / denom for (i,j) in points]
         chosen_idx = np.random.choice(len(points), p=probabilities)
         return points[chosen_idx]
 
@@ -141,8 +144,8 @@ class Segmentator:
         return np.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2)
     
     # distance between a point and the closest endpoint
-    def dist(self, p0):
-        return min([self._dist(p0, p1) for p1 in self.endpoints])
+    def dist(self, p0, initial_endpoint):
+        return min([self._dist(p0, p1) for p1 in self.endpoints if p1 != initial_endpoint])
 
 # can iterate over and add elements
 class LimitedQueue:
@@ -172,13 +175,28 @@ class LimitedQueue:
 
 
 def draw_endpoints(img, pts):
-    img2 = img.copy()
-    img2 = cv2.cvtColor(img2, cv2.COLOR_GRAY2RGB)
+    # verify if image not already rgb
+    if len(img.shape) == 3:
+        img2 = img.copy()
+    else:
+        img2 = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     for pt in pts:
         #img2 = cv2.circle(img2, (pt[0], pt[1]), 2, (0,255,0), -1)
         # draw a small square
         img2 = cv2.rectangle(img2, (pt[0]-1, pt[1]-1), (pt[0]+1, pt[1]+1), (0,255,0), -1)
     return img2
+
+def draw_comparison(sobel, visited):
+    img = cv2.cvtColor(sobel, cv2.COLOR_GRAY2RGB)
+    img[sobel == 0] = [255,0,0]
+
+    diff_img = np.where((visited == 0) & (sobel == 255), 0, 255)
+    img[diff_img == 0] = [0,0,255]
+
+    # set background to gray
+    img[(visited == 255) & (sobel == 255)] = [128,128,128]
+
+    return diff_img, img
 
 def main(args):
     iterations = args.iterations
@@ -207,6 +225,12 @@ def write_imgs(segmentator, sobel_img, output_dir):
     cv2.imwrite(outdir / 'visited.bmp', visited_img)
 
     cv2.imwrite(outdir / 'pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
+
+    diff_img, cmp_img = draw_comparison(sobel_img, visited_img)
+
+    cv2.imwrite(outdir / 'diff.bmp', diff_img)
+    cv2.imwrite(outdir / 'cmp.bmp', cmp_img)
+    cv2.imwrite(outdir / 'cmp-endpoints.bmp', draw_endpoints(cmp_img, segmentator.endpoints))
     
     result = np.minimum(visited_img, sobel_img)
     cv2.imwrite(outdir / 'result.bmp', result)
