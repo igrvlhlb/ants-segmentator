@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import tqdm
 import pathlib
 import argparse
 import sys
@@ -58,8 +59,11 @@ class Segmentator:
     def ant_colony_optimization(self, alpha=ALPHA, beta=BETA, rho=RHO, q=Q, limit=10):
         n_initial = len(self.ants)
         stopped_ants = []
+        pbar = tqdm.tqdm(total=limit)
         for iteration in range(limit):
-            print(f'iteration: {iteration} ({len(self.ants)}/{n_initial} ants)')
+            pbar.desc = f'({len(self.ants)}/{n_initial} ants)'
+            #if VERBOSE:
+                #print(f'iteration: {iteration} ({len(self.ants)}/{n_initial} ants)')
             if (stopped_ants):
                 ants_to_remove = sorted(stopped_ants, reverse=True)
                 for idx in ants_to_remove:
@@ -82,6 +86,8 @@ class Segmentator:
                     stopped_ants.append(k)
                     print(f"Endpoint found by ant {k}")
             self.pheromone_update(rho, q)
+            pbar.update(1)
+        pbar.close()
         return self.pheromone_matrix
 
     def calc_transition_for_ant(self, k, alpha, beta):
@@ -202,8 +208,6 @@ def write_imgs(segmentator, sobel_img, output_dir):
 
     cv2.imwrite(outdir / 'pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
     
-    cv2.imwrite(outdir / 'pheromone_matrix_nonzero.bmp', np.array(np.where(segmentator.pheromone_matrix > 0, 0, 255), 'uint8'))
-
     result = np.minimum(visited_img, sobel_img)
     cv2.imwrite(outdir / 'result.bmp', result)
 
