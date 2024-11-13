@@ -1,9 +1,9 @@
 magick peppers.tiff -resize 256x256! -colorspace Gray -depth 8 BMP3:peppers.bmp
 convert peppers.bmp \
-	-gaussian-blur 0.8 \
 	-define convolve:scale='!' \
 	-define morphology:compose=Lighten \
 	-morphology Convolve  'Sobel:>' \
+	-threshold 30% \
 	-type Bilevel \
 	BMP3:peppers-sobel.bmp
 
