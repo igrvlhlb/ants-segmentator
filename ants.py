@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+import pathlib
 import argparse
 import sys
 from ast import Tuple
@@ -175,38 +178,50 @@ def main(args):
     iterations = args.iterations
     alpha, beta, rho, q = args.alpha, args.beta, args.rho, args.q
 
-    original_img = cv2.imread('peppers.bmp', flags=cv2.IMREAD_GRAYSCALE)
-    sobel_img = cv2.imread('peppers-sobel-thin.bmp', flags=cv2.IMREAD_GRAYSCALE)
+    original_img = cv2.imread(args.grayscale, flags=cv2.IMREAD_GRAYSCALE)
+    sobel_img = cv2.imread(args.sobel, flags=cv2.IMREAD_GRAYSCALE)
 
     segmentator = Segmentator(original_img, sobel_img, args.memory)
     print(f"{len(segmentator.endpoints)} endpoints found")
-    cv2.imwrite('res/endpoints.bmp', draw_endpoints(sobel_img, segmentator.endpoints))
     segmentator.ant_colony_optimization(alpha, beta, rho, q, iterations)
+
+    write_imgs(segmentator, sobel_img, args.output)
+
+def write_imgs(segmentator, sobel_img, output_dir):
+
+    outdir = pathlib.Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     visited_img = np.where(segmentator.visited_matrix == True, 0, 255)
 
-    cv2.imwrite('res/visibility_matrix.bmp', segmentator.visibility_matrix*255)
+    cv2.imwrite(outdir / 'endpoints.bmp', draw_endpoints(sobel_img, segmentator.endpoints))
 
-    cv2.imwrite('res/visited.bmp', visited_img)
+    cv2.imwrite(outdir / 'visibility_matrix.bmp', segmentator.visibility_matrix*255)
 
-    cv2.imwrite('res/pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
+    cv2.imwrite(outdir / 'visited.bmp', visited_img)
+
+    cv2.imwrite(outdir / 'pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
     
-    cv2.imwrite('res/pheromone_matrix_nonzero.bmp', np.array(np.where(segmentator.pheromone_matrix > 0, 0, 255), 'uint8'))
+    cv2.imwrite(outdir / 'pheromone_matrix_nonzero.bmp', np.array(np.where(segmentator.pheromone_matrix > 0, 0, 255), 'uint8'))
 
     result = np.minimum(visited_img, sobel_img)
-    cv2.imwrite('res/result.bmp', result)
+    cv2.imwrite(outdir / 'result.bmp', result)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Ant Colony Optimization for image segmentation')
+    parser.add_argument('grayscale', type=str, help='Grayscale Image file')
+    parser.add_argument('sobel', type=str, help='Sobel Image file')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print debug information')
     parser.add_argument('-i', '--iterations', type=int, default=10, help='Number of iterations')
-    parser.add_argument('-o', '--output', default='res', help='Output directory')
+    parser.add_argument('-o', '--output', default='outputs', help='Output directory')
     parser.add_argument('-m', '--memory', type=int, default=10, help='Tabu list max size')
     parser.add_argument('-a', '--alpha', type=float, default=10, help='Alpha parameter')
     parser.add_argument('-b', '--beta', type=float, default=1, help='Beta parameter')
     parser.add_argument('-r', '--rho', type=float, default=0.05, help='Rho parameter')
     parser.add_argument('-q', '--q', type=float, default=1, help='Q parameter')
     return parser.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
