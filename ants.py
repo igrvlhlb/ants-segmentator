@@ -2,12 +2,16 @@ from ast import Tuple
 import cv2
 import numpy as np
 from functools import reduce
-from numba import jit, float64, int32
+from numba import jit, float64, int64, typed, types
+from numba.types import UniTuple
 
 ALPHA = 10
 BETA = 1
 RHO = 0.05
 Q = 1
+
+INT_PAIR = UniTuple(int64, 2)
+
 
 class Segmentator:
     def __init__(self, original_img, sobel_img):
@@ -40,7 +44,7 @@ class Segmentator:
 
         return [(x,y) for (y,x) in pts if img[x,y] == 0]
 
-    def ant_colony_optimization(self, visited_matrix, limit=300):
+    def ant_colony_optimization(self, visited_matrix, limit=10):
         stopped_ants = []
         for iteration in range(limit):
             print(iteration)
@@ -66,7 +70,7 @@ class Segmentator:
                     stopped_ants.append(k)
                     print(f"Endpoint found by ant {k}")
             self.pheromone_update()
-        return pheromone_matrix
+        return self.pheromone_matrix
 
     def calc_transition_for_ant(self, k):
         r, s = self.ants[k]
@@ -115,13 +119,13 @@ class Segmentator:
         return visibility_matrix
 
     @staticmethod
-    @jit(float64(int32, int32, int32, int32), nopython=True, fastmath=True, cache=True)
-    def _dist(p0x, p0y, p1x, p1y):
-        return np.sqrt((p0x - p1x)**2 + (p0y - p1y)**2)
+    @jit(float64(INT_PAIR, INT_PAIR), nopython=True, fastmath=True, cache=True)
+    def _dist(p0, p1):
+        return np.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2)
     
     # distance between a point and the closest endpoint
     def dist(self, p0):
-        return min([self._dist(p0[0], p0[1], p1[0], p1[1]) for p1 in self.endpoints])
+        return min([self._dist(p0, p1) for p1 in self.endpoints])
 
 # can iterate over and add elements
 class LimitedQueue:
@@ -173,9 +177,9 @@ def main():
 
     cv2.imwrite('res/visited.bmp', visited_img)
 
-    cv2.imwrite('res/pheromone_matrix.bmp', (pheromone_matrix / pheromone_matrix.max())*255)
+    cv2.imwrite('res/pheromone_matrix.bmp', (segmentator.pheromone_matrix / segmentator.pheromone_matrix.max())*255)
     
-    cv2.imwrite('res/pheromone_matrix_nonzero.bmp', np.array(np.where(pheromone_matrix > 0, 0, 255), 'uint8'))
+    cv2.imwrite('res/pheromone_matrix_nonzero.bmp', np.array(np.where(segmentator.pheromone_matrix > 0, 0, 255), 'uint8'))
 
     result = np.minimum(visited_img, sobel_img)
     cv2.imwrite('res/result.bmp', result)
